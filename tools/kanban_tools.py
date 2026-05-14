@@ -384,6 +384,22 @@ def _handle_complete(args: dict, **kw) -> str:
         created_cards = [
             str(c).strip() for c in created_cards if str(c).strip()
         ]
+    # created_artifacts: structured manifest of non-Kanban side-effects
+    # the worker claims to have created (cron jobs today, more kinds
+    # later).  Same convenience rule as created_cards — accept a single
+    # entry instead of forcing a one-element list — but the entries
+    # themselves can be either dicts ({kind, id, name?}) or bare
+    # strings (interpreted as cron ids by kanban_db._normalize_artifacts).
+    # Issue #25288.
+    created_artifacts = args.get("created_artifacts")
+    if created_artifacts is not None:
+        if isinstance(created_artifacts, (str, dict)):
+            created_artifacts = [created_artifacts]
+        if not isinstance(created_artifacts, (list, tuple)):
+            return tool_error(
+                f"created_artifacts must be a list, got "
+                f"{type(created_artifacts).__name__}"
+            )
     if not (summary or result):
         return tool_error(
             "provide at least one of: summary (preferred), result"
@@ -400,6 +416,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     conn, tid,
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
+                    created_artifacts=created_artifacts,
                     expected_run_id=_worker_run_id(tid),
                 )
             except kb.HallucinatedCardsError as hall_err:
@@ -421,6 +438,32 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.HallucinatedArtifactsError as art_err:
+                # Sibling-gate rejection (issue #25288).  Surface every
+                # phantom artifact with its kind, id, and the reason the
+                # verifier rejected it so the agent can either correct
+                # the claim (e.g. agent thought it created a cron but
+                # actually got a tool_error) or actually create the
+                # artifact and retry.  Same "no state change, retry is
+                # safe" hint as the card gate to avoid a misread that
+                # crashes the run.
+                rendered = "; ".join(
+                    f"{p.get('kind', '?')}={p.get('id', '?')} "
+                    f"({p.get('reason', 'unverified')})"
+                    for p in art_err.phantom
+                )
+                return tool_error(
+                    f"kanban_complete blocked: the following "
+                    f"created_artifacts could not be verified: {rendered}. "
+                    f"Your task is still in-flight (no state change). "
+                    f"Either (a) actually create the missing artifact and "
+                    f"retry with the real id, (b) drop the bogus entry from "
+                    f"created_artifacts and retry, or (c) call kanban_block "
+                    f"with the underlying error if you cannot create it. "
+                    f"Do NOT mark the task done while the artifact is "
+                    f"missing — that's exactly the failure mode reported "
+                    f"in #25288."
                 )
             if not ok:
                 return tool_error(
@@ -809,6 +852,70 @@ KANBAN_COMPLETE_SCHEMA = {
                     "``kanban_create`` call — do not invent or "
                     "remember ids from prose. Omit the field if you "
                     "did not create any cards."
+                ),
+            },
+            "created_artifacts": {
+                "type": "array",
+                "items": {
+                    "oneOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "description": (
+                                        "Artifact kind. Currently "
+                                        "verified: 'cron'. Other "
+                                        "kinds are recorded but not "
+                                        "verified (advisory only)."
+                                    ),
+                                },
+                                "id": {
+                                    "type": "string",
+                                    "description": (
+                                        "Artifact identifier the "
+                                        "kernel can look up — for "
+                                        "kind='cron', the job_id "
+                                        "returned by cronjob "
+                                        "action='create'."
+                                    ),
+                                },
+                                "name": {
+                                    "type": "string",
+                                    "description": (
+                                        "Optional human label, "
+                                        "stored on the audit event."
+                                    ),
+                                },
+                            },
+                            "required": ["kind", "id"],
+                        },
+                        {
+                            "type": "string",
+                            "description": (
+                                "Bare cron job_id — interpreted as "
+                                "{kind: 'cron', id: <string>}."
+                            ),
+                        },
+                    ],
+                },
+                "description": (
+                    "Optional structured manifest of NON-Kanban "
+                    "side-effects you created during this run (cron "
+                    "jobs today, more kinds later). For each entry "
+                    "the kernel calls a kind-specific verifier — "
+                    "currently kind='cron' looks up the job_id in "
+                    "cron.jobs.get_job. Any phantom artifact blocks "
+                    "the completion with an error listing what could "
+                    "not be verified (auditable in the task's events). "
+                    "USE THIS WHENEVER your task's definition of done "
+                    "is 'X exists' — declaring the X as a created "
+                    "artifact lets the kernel catch the case where "
+                    "you THOUGHT you created it but the underlying "
+                    "tool_error was missed. Issue #25288 is exactly "
+                    "this failure mode for cron jobs. Only list ids "
+                    "you got back from a successful create call — "
+                    "do not invent ids. Omit if you created nothing."
                 ),
             },
         },

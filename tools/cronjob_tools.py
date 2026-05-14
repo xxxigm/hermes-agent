@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     create_job,
+    find_jobs,
     get_job,
     list_jobs,
     parse_schedule,
@@ -31,6 +32,21 @@ from cron.jobs import (
     trigger_job,
     update_job,
 )
+
+
+def _find_existing_for_idempotency_key(key: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return the prior job dict for ``key`` if one already exists.
+
+    Used by the ``cronjob`` create branch to detect whether the call is
+    going to be deduped by ``create_job`` so the response message can
+    say "reused" instead of "created".  Returns ``None`` when no key is
+    given OR when no matching job exists yet (the create call will then
+    mint a new one).
+    """
+    if not key:
+        return None
+    matches = find_jobs(idempotency_key=key, include_disabled=True)
+    return matches[0] if matches else None
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +318,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    idempotency_key: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -352,6 +369,17 @@ def cronjob(
                             success=False,
                         )
 
+            # Idempotency: detect a duplicate up front so the response
+            # message reads "reused existing" rather than "created" — a
+            # silent dedup would mask the agent's own retry behaviour
+            # from the model and reinforce the "I created N of these"
+            # confusion that #25288 grew out of.
+            normalized_key = (idempotency_key or "").strip() or None
+            preexisting = (
+                _find_existing_for_idempotency_key(normalized_key)
+                if normalized_key else None
+            )
+
             job = create_job(
                 prompt=prompt or "",
                 schedule=schedule,
@@ -368,23 +396,28 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                idempotency_key=normalized_key,
             )
-            return json.dumps(
-                {
-                    "success": True,
-                    "job_id": job["id"],
-                    "name": job["name"],
-                    "skill": job.get("skill"),
-                    "skills": job.get("skills", []),
-                    "schedule": job["schedule_display"],
-                    "repeat": _repeat_display(job),
-                    "deliver": job.get("deliver", "local"),
-                    "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
-                    "message": f"Cron job '{job['name']}' created.",
-                },
-                indent=2,
-            )
+            response = {
+                "success": True,
+                "job_id": job["id"],
+                "name": job["name"],
+                "skill": job.get("skill"),
+                "skills": job.get("skills", []),
+                "schedule": job["schedule_display"],
+                "repeat": _repeat_display(job),
+                "deliver": job.get("deliver", "local"),
+                "next_run_at": job["next_run_at"],
+                "job": _format_job(job),
+                "idempotency_key": job.get("idempotency_key"),
+                "message": (
+                    f"Cron job '{job['name']}' reused (idempotency_key matched)."
+                    if preexisting else
+                    f"Cron job '{job['name']}' created."
+                ),
+                "reused": bool(preexisting),
+            }
+            return json.dumps(response, indent=2)
 
         if normalized == "list":
             jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
@@ -634,6 +667,26 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "idempotency_key": {
+                "type": "string",
+                "description": (
+                    "Optional caller-supplied dedup key for create. "
+                    "First call with this key mints a new job; "
+                    "subsequent calls with the same key return the "
+                    "existing job (response.reused=true) instead of "
+                    "creating a duplicate. Use this whenever you may "
+                    "retry — e.g. when the user re-asks 'create that "
+                    "monitoring cron' across sessions, or when your "
+                    "own previous attempt errored ambiguously and you "
+                    "are not sure whether the job landed. A natural "
+                    "key is a hash / slug of the (prompt, schedule) "
+                    "pair, or a stable Kanban task id when you are "
+                    "creating the cron from a kanban worker. Without "
+                    "this field create is non-idempotent — every call "
+                    "produces a new job, which is the failure mode "
+                    "behind issue #25288."
+                ),
+            },
         },
         "required": ["action"]
     }
@@ -682,6 +735,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        idempotency_key=args.get("idempotency_key"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,
