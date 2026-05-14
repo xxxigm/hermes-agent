@@ -2348,6 +2348,153 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+# ---------------------------------------------------------------------------
+# created_artifacts gate (issue #25288)
+#
+# Sibling to ``created_cards`` for non-Kanban side-effects.  The card gate
+# only protects against phantom *task* ids; #25288 is about agents claiming
+# they created a *cron job* (or any other artifact whose existence the
+# kernel can verify) when in fact they did not.  Schema mirrors the card
+# gate so the prompt + agent can use a single pattern across both.
+#
+# Each entry is ``{"kind": <str>, "id": <str>}`` plus optional
+# ``"name"``.  Only the kinds in ``ARTIFACT_VERIFIERS`` are checked
+# (others pass through with an advisory event so a future kind can be
+# added without breaking existing payloads).  Verifiers are pluggable so
+# new artifact kinds (file paths, PR urls, calendar event ids…) can be
+# added in one place without re-touching ``complete_task``.
+# ---------------------------------------------------------------------------
+
+
+class HallucinatedArtifactsError(ValueError):
+    """Raised by ``complete_task`` when ``created_artifacts`` contains
+    entries whose verifier returned "does not exist".
+
+    The phantom list is attached as ``.phantom`` for structured
+    callers; each entry is the original ``{"kind", "id", ...}`` dict
+    plus a ``"reason"`` field describing why it failed verification.
+    Subclass of ``ValueError`` so existing tool-error handling keeps
+    treating it as a recoverable user error (the worker can drop the
+    bogus claim and retry).
+    """
+
+    def __init__(self, phantom: list[dict], completing_task_id: str):
+        self.phantom = [dict(p) for p in phantom]
+        self.completing_task_id = completing_task_id
+        rendered = ", ".join(
+            f"{p.get('kind', '?')}={p.get('id', '?')}" for p in phantom
+        )
+        super().__init__(
+            f"completion blocked: claimed created_artifacts that could not "
+            f"be verified: {rendered}"
+        )
+
+
+def _verify_artifact_cron(artifact_id: str) -> tuple[bool, str | None]:
+    """Verifier for ``kind='cron'`` — looks up the job in cron.jobs.
+
+    Returns ``(verified, reason_if_phantom)``.  ``reason`` is a short
+    human-readable string suitable for surfacing to the worker.
+
+    Imported lazily so the kanban DB layer does not pull cron into
+    every test fixture and so a missing/broken cron module does not
+    crash unrelated completions — when cron itself is unavailable we
+    treat the artifact as unverifiable (advisory) rather than phantom.
+    """
+    try:
+        from cron import jobs as _cron_jobs
+    except Exception:
+        return False, "cron module unavailable — could not verify"
+    try:
+        job = _cron_jobs.get_job(artifact_id)
+    except Exception as exc:
+        return False, f"cron.get_job failed: {exc}"
+    if job is None:
+        return False, "no cron job with this id exists"
+    return True, None
+
+
+# Map of ``kind`` → verifier callable.  Callers register additional
+# kinds by mutating this dict (e.g. tests, plugins).  Kinds NOT in this
+# map are recorded on the completion event but never block — that way a
+# future kind can be added without an immediate kernel-side update.
+ARTIFACT_VERIFIERS: dict[str, "callable[[str], tuple[bool, str | None]]"] = {
+    "cron": _verify_artifact_cron,
+}
+
+
+def _normalize_artifacts(
+    raw: Iterable[Any] | None,
+) -> list[dict]:
+    """Coerce caller-supplied artifact entries into a clean list of dicts.
+
+    Accepts either a list of dicts (preferred) or a list of strings
+    (legacy / convenience — interpreted as ``{"kind": "cron", "id": s}``
+    so an agent that just paste-dropped job ids still gets verified
+    rather than silently passed through).  Raises ``ValueError`` when
+    an entry has no ``id`` field at all — that is always a programmer
+    error, never a recoverable agent slip.
+    """
+    if raw is None:
+        return []
+    out: list[dict] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            ident = entry.strip()
+            if not ident:
+                continue
+            out.append({"kind": "cron", "id": ident})
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"created_artifacts entries must be dicts or strings, "
+                f"got {type(entry).__name__}"
+            )
+        ident = str(entry.get("id") or "").strip()
+        if not ident:
+            raise ValueError(
+                "created_artifacts entry missing required 'id' field"
+            )
+        kind = str(entry.get("kind") or "cron").strip().lower() or "cron"
+        clean = {"kind": kind, "id": ident}
+        name = entry.get("name")
+        if name:
+            clean["name"] = str(name).strip() or None
+        out.append(clean)
+    return out
+
+
+def _verify_created_artifacts(
+    artifacts: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Run each artifact through its kind-specific verifier.
+
+    Returns ``(verified, phantom, advisory)`` where:
+
+    * ``verified`` — entries whose verifier returned True
+    * ``phantom``  — entries whose verifier returned False (these
+      block completion; each carries a ``"reason"`` field)
+    * ``advisory`` — entries whose ``kind`` is not in
+      :data:`ARTIFACT_VERIFIERS` (recorded on the event log but
+      do NOT block — keeps the gate forward-compatible with kinds
+      added by plugins after the agent prompt was rendered)
+    """
+    verified: list[dict] = []
+    phantom: list[dict] = []
+    advisory: list[dict] = []
+    for entry in artifacts:
+        verifier = ARTIFACT_VERIFIERS.get(entry["kind"])
+        if verifier is None:
+            advisory.append({**entry, "reason": "no verifier registered"})
+            continue
+        ok, reason = verifier(entry["id"])
+        if ok:
+            verified.append(entry)
+        else:
+            phantom.append({**entry, "reason": reason or "verification failed"})
+    return verified, phantom, advisory
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2356,6 +2503,7 @@ def complete_task(
     summary: Optional[str] = None,
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
+    created_artifacts: Optional[Iterable[Any]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
@@ -2379,6 +2527,18 @@ def complete_task(
     ``completion_blocked_hallucination`` event is emitted so the rejected
     attempt is auditable. When all ids verify, they are recorded on the
     ``completed`` event payload.
+
+    ``created_artifacts`` is the sibling gate for non-Kanban side-effects
+    (issue #25288).  Each entry is ``{"kind": <str>, "id": <str>}`` (or
+    a bare string interpreted as ``kind="cron"``); the kernel calls the
+    matching verifier in :data:`ARTIFACT_VERIFIERS` (currently:
+    ``"cron"`` → :func:`cron.jobs.get_job`).  Phantom entries block
+    completion with :class:`HallucinatedArtifactsError` and emit a
+    ``completion_blocked_artifact_hallucination`` event; verified entries
+    land on the ``completed`` event payload.  Kinds with no registered
+    verifier are recorded on the event log as advisory only — keeps the
+    gate forward-compatible with kinds that plugins add after the agent
+    prompt was rendered.
 
     After a successful completion, ``summary`` and ``result`` are scanned
     for prose references like ``t_deadbeefcafe`` that do not resolve.
@@ -2414,6 +2574,37 @@ def complete_task(
             raise HallucinatedCardsError(phantom_cards, task_id)
     else:
         verified_cards = []
+
+    # Sibling gate: verify created_artifacts (cron jobs, etc.) BEFORE
+    # the main write txn.  Same audit-then-raise discipline as the
+    # card gate so a rejected completion is always reconstructable
+    # from the event log.  The check itself never mutates SQL state
+    # so a phantom-artifact rejection leaves the task exactly as it
+    # was — the worker can fix the claim and call again.
+    artifacts_norm = _normalize_artifacts(created_artifacts)
+    if artifacts_norm:
+        verified_arts, phantom_arts, advisory_arts = _verify_created_artifacts(
+            artifacts_norm
+        )
+        if phantom_arts:
+            with write_txn(conn):
+                _append_event(
+                    conn, task_id, "completion_blocked_artifact_hallucination",
+                    {
+                        "phantom_artifacts": phantom_arts,
+                        "verified_artifacts": verified_arts,
+                        "advisory_artifacts": advisory_arts,
+                        "summary_preview": (
+                            (summary or result or "").strip().splitlines()[0][:200]
+                            if (summary or result)
+                            else None
+                        ),
+                    },
+                )
+            raise HallucinatedArtifactsError(phantom_arts, task_id)
+    else:
+        verified_arts = []
+        advisory_arts = []
 
     with write_txn(conn):
         if expected_run_id is None:
@@ -2478,6 +2669,10 @@ def complete_task(
         }
         if verified_cards:
             completed_payload["verified_cards"] = verified_cards
+        if verified_arts:
+            completed_payload["verified_artifacts"] = verified_arts
+        if advisory_arts:
+            completed_payload["advisory_artifacts"] = advisory_arts
         _append_event(
             conn, task_id, "completed",
             completed_payload,
