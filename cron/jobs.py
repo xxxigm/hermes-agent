@@ -496,6 +496,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    idempotency_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -540,10 +541,30 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        idempotency_key: Optional caller-supplied dedup key.  When set, the
+                first call mints a new job and stores the key on the job
+                record; subsequent calls with the same key return the
+                existing (non-removed) job dict unchanged instead of
+                creating a duplicate.  This is the cron-side guard against
+                the "agent retried because the user re-asked, ended up
+                with three of the same job" failure mode reported in
+                #25288.  Match is exact, case-sensitive, and scoped to the
+                whole jobs.json file (not per-origin).
 
     Returns:
         The created job dict
     """
+    # Idempotency check runs BEFORE we do any normalisation / validation.
+    # A repeat call with the same key must not raise (e.g., on a script
+    # path that has since been deleted) — it must return the prior job
+    # so the caller's downstream "verify it exists" check still passes.
+    # Keep the lock fine-grained: load → check → return without mutating.
+    key = (idempotency_key or "").strip() or None
+    if key:
+        existing = _find_job_by_idempotency_key(key)
+        if existing is not None:
+            return _normalize_job_record(existing)
+
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -597,6 +618,7 @@ def create_job(
     job = {
         "id": job_id,
         "name": name or label_source[:50].strip(),
+        "idempotency_key": key,
         "prompt": prompt_text,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,
@@ -643,6 +665,53 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
         if job["id"] == job_id:
             return _normalize_job_record(job)
     return None
+
+
+def _find_job_by_idempotency_key(key: str) -> Optional[Dict[str, Any]]:
+    """Return the raw (un-normalized) job record matching ``idempotency_key``.
+
+    Used internally by :func:`create_job` to short-circuit duplicate
+    creates.  Kept private and returning the raw record so the caller
+    can normalise once before handing back to the user; external
+    callers should use :func:`find_jobs` instead.
+    """
+    if not key:
+        return None
+    for job in load_jobs():
+        if (job.get("idempotency_key") or "") == key:
+            return job
+    return None
+
+
+def find_jobs(
+    *,
+    idempotency_key: Optional[str] = None,
+    name: Optional[str] = None,
+    include_disabled: bool = True,
+) -> List[Dict[str, Any]]:
+    """Look up jobs by structured fields without going through the LLM tool.
+
+    Used by other plugins (notably the kanban completion gate added for
+    issue #25288) to verify that a cron job an agent claims to have
+    created actually exists.  Filters compose with AND semantics; pass
+    only the fields you want to constrain.
+
+    ``idempotency_key`` does an exact, case-sensitive match.  ``name``
+    does a case-insensitive substring match because cron job names are
+    auto-derived from the prompt and rarely an exact stable handle.
+    """
+    key = (idempotency_key or "").strip() or None
+    name_q = (name or "").strip().lower() or None
+    out: List[Dict[str, Any]] = []
+    for job in load_jobs():
+        if not include_disabled and not job.get("enabled", True):
+            continue
+        if key is not None and (job.get("idempotency_key") or "") != key:
+            continue
+        if name_q is not None and name_q not in (job.get("name") or "").lower():
+            continue
+        out.append(_normalize_job_record(job))
+    return out
 
 
 def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
