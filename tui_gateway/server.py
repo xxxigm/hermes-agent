@@ -1601,6 +1601,33 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     return overrides
 
 
+def _canonical_provider_identity(provider: str | None, base_url: str | None) -> str:
+    """Recover a named custom provider's canonical ``custom:<name>`` menu key.
+
+    ``agent.provider`` is the RESOLVED billing class, and for any named
+    ``providers:`` / ``custom_providers:`` entry that is the literal string
+    ``"custom"`` — the entry identity (and with it key_env/api_key resolution)
+    is lost. Map the endpoint URL back to the entry's menu key so the identity
+    survives BOTH being persisted to the session DB (``_runtime_model_config``)
+    AND being reported to the desktop composer via ``session.info``, which
+    persists it and round-trips it back through ``session.create`` as a
+    per-session override. Reporting the bare ``"custom"`` there made every
+    new chat after the first re-resolve to a credential-less endpoint and fail
+    with "No LLM provider configured". Built-in providers and endpoints with no
+    matching config entry pass through unchanged.
+    """
+    provider = str(provider or "").strip()
+    base_url = str(base_url or "").strip()
+    if provider == "custom" and base_url:
+        try:
+            from hermes_cli.runtime_provider import find_custom_provider_identity
+
+            return find_custom_provider_identity(base_url) or provider
+        except Exception:
+            logger.debug("custom provider identity lookup failed", exc_info=True)
+    return provider
+
+
 def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     config = dict(existing or {})
     model = str(getattr(agent, "model", "") or "").strip()
@@ -1613,26 +1640,11 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     if model:
         config["model"] = model
     if provider:
-        if provider == "custom" and base_url:
-            # ``agent.provider`` is the RESOLVED provider, and for any named
-            # ``providers:`` / ``custom_providers:`` entry that is the literal
-            # string "custom" — persisting it loses the entry identity, so a
-            # later resume/rebuild cannot re-resolve the entry's credentials
-            # (the api_key is deliberately never persisted; see
-            # _stored_session_runtime_overrides). Recover the canonical
-            # ``custom:<name>`` menu key from the endpoint URL so
-            # resolve_runtime_provider() can find the entry again.
-            try:
-                from hermes_cli.runtime_provider import (
-                    find_custom_provider_identity,
-                )
-
-                provider = find_custom_provider_identity(base_url) or provider
-            except Exception:
-                logger.debug(
-                    "custom provider identity lookup failed", exc_info=True
-                )
-        config["provider"] = provider
+        # Persist the entry identity, not the resolved bare "custom" — a later
+        # resume/rebuild cannot re-resolve a named entry's credentials from
+        # "custom" alone (the api_key is deliberately never persisted; see
+        # _stored_session_runtime_overrides).
+        config["provider"] = _canonical_provider_identity(provider, base_url)
     if base_url:
         config["base_url"] = base_url
     else:
@@ -2528,7 +2540,16 @@ def _session_info(agent, session: dict | None = None) -> dict:
         yolo = False
     info: dict = {
         "model": getattr(agent, "model", ""),
-        "provider": getattr(agent, "provider", ""),
+        # Report the canonical ``custom:<name>`` identity for a named custom
+        # provider rather than the bare resolved ``"custom"``. The desktop
+        # composer persists this and ships it back on the next session.create
+        # as a per-session override; bare ``"custom"`` lost the entry identity
+        # and made every new chat after the first fail with "No LLM provider
+        # configured". Keeps the live report in sync with the value persisted
+        # by _runtime_model_config.
+        "provider": _canonical_provider_identity(
+            getattr(agent, "provider", ""), getattr(agent, "base_url", "")
+        ),
         "reasoning_effort": reasoning_effort,
         "service_tier": service_tier,
         "fast": service_tier == "priority",
