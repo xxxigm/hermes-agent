@@ -196,3 +196,84 @@ class TestResumeRoundTrip:
         assert kwargs["provider"] == "custom"
         assert kwargs["base_url"] == "http://127.0.0.1:8000/v1"
         assert kwargs["api_key"] == "no-key-required"
+
+
+class TestSessionInfoReportsCanonicalIdentity:
+    """session.info must report the entry identity, not the bare resolved
+    "custom".
+
+    The desktop composer's model picker is sticky session state: it persists
+    whatever ``session.info`` reports as the live provider and ships it back on
+    the next ``session.create`` as a per-session override (NO base_url — that
+    isn't part of the picker's state). Reporting the bare resolved ``"custom"``
+    for a named ``providers:`` / ``custom_providers:`` entry meant the second
+    and every later chat re-resolved a credential-less endpoint and failed with
+    "No LLM provider configured" — while the very first chat (built from config,
+    not from the round-tripped override) worked. Reporting the canonical
+    ``custom:<name>`` menu key keeps the entry resolvable across the round-trip.
+    """
+
+    def test_helper_maps_resolved_custom_to_menu_key(self, monkeypatch):
+        monkeypatch.setattr(rp, "load_config", lambda: PROVIDERS_DICT_CONFIG)
+
+        from tui_gateway.server import _canonical_provider_identity
+
+        assert _canonical_provider_identity("custom", MIMO_URL) == "custom:mimo-v2.5-pro"
+
+    def test_helper_passes_builtin_providers_through_untouched(self, monkeypatch):
+        def _boom():
+            raise AssertionError("identity lookup must not run for built-ins")
+
+        monkeypatch.setattr(rp, "load_config", _boom)
+
+        from tui_gateway.server import _canonical_provider_identity
+
+        assert (
+            _canonical_provider_identity("anthropic", "https://api.anthropic.com")
+            == "anthropic"
+        )
+
+    def test_helper_keeps_bare_custom_when_no_entry_matches(self, monkeypatch):
+        monkeypatch.setattr(rp, "load_config", lambda: {})
+
+        from tui_gateway.server import _canonical_provider_identity
+
+        assert _canonical_provider_identity("custom", MIMO_URL) == "custom"
+
+    def test_reported_identity_round_trips_to_entry_credentials(self, monkeypatch):
+        """The provider session.info reports for a named-custom agent, shipped
+        back by the composer on session.create WITHOUT a base_url, must still
+        re-resolve the entry's real credentials — the exact round-trip that
+        regressed to "No LLM provider configured"."""
+        monkeypatch.setattr(rp, "load_config", lambda: LEGACY_LIST_CONFIG)
+
+        from tui_gateway.server import _canonical_provider_identity
+
+        reported = _canonical_provider_identity("custom", MIMO_URL)
+        assert reported == "custom:mimo-v2.5-pro"
+
+        kwargs = _make_agent_with_override(
+            {"model": "mimo-v2.5-pro", "provider": reported},
+            monkeypatch,
+            LEGACY_LIST_CONFIG,
+        )
+
+        assert kwargs["provider"] == "custom"
+        assert kwargs["base_url"] == MIMO_URL
+        assert kwargs["api_key"] == MIMO_KEY
+
+    def test_bare_custom_override_without_base_url_loses_entry(self, monkeypatch):
+        """Regression guard documenting the pre-fix failure: the bare resolved
+        "custom" (no base_url) can NOT recover the entry, so it never resolves
+        the entry's key — proving the canonical identity is what fixes the
+        round-trip."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        kwargs = _make_agent_with_override(
+            {"model": "mimo-v2.5-pro", "provider": "custom"},
+            monkeypatch,
+            LEGACY_LIST_CONFIG,
+        )
+
+        assert kwargs["api_key"] != MIMO_KEY
