@@ -9,6 +9,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  clearQueuedPrompts,
   enqueueQueuedPrompt,
   getQueuedPrompts,
   isSteerableEntry,
@@ -22,6 +23,7 @@ import {
   updateQueuedPrompt
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
+import { $sessionsLoading, ownerLookupSessionRows, sessionRowsIncludeId } from '@/store/session'
 
 import { cloneAttachments, type QueueEditState } from '../composer-utils'
 import { useComposerScope } from '../scope'
@@ -80,6 +82,7 @@ export function useComposerQueue({
   // is fine; the auto-drain effect below reads it as a gate.
   const parkedSessions = useStore($parkedQueueSessions)
   const queueParked = Boolean(activeQueueSessionKey && parkedSessions[activeQueueSessionKey])
+  const sessionsLoading = useStore($sessionsLoading)
 
   const [queueEdit, setQueueEdit] = useState<QueueEditState | null>(null)
   queueEditRef.current = queueEdit
@@ -345,6 +348,8 @@ export function useComposerQueue({
     let cancelled = false
     let retryTimer: ReturnType<typeof setTimeout> | undefined
 
+    const drainQueueSessionKey = activeQueueSessionKey
+
     const onFail = () => {
       if (cancelled) {
         return
@@ -353,16 +358,24 @@ export function useComposerQueue({
       const fails = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
       drainFailuresRef.current.set(entry.id, fails)
 
-      if (fails >= MAX_AUTO_DRAIN_ATTEMPTS) {
-        notify({
-          id: 'composer-queue-stuck',
-          kind: 'error',
-          title: t.composer.queueStuckTitle,
-          message: t.composer.queueStuckBody
-        })
-      } else {
+      if (fails < MAX_AUTO_DRAIN_ATTEMPTS) {
         retryTimer = setTimeout(() => setDrainRetryTick(tick => tick + 1), 750 * fails)
+
+        return
       }
+
+      if (!sessionRowsIncludeId(ownerLookupSessionRows(), drainQueueSessionKey)) {
+        clearQueuedPrompts(drainQueueSessionKey)
+
+        return
+      }
+
+      notify({
+        id: 'composer-queue-stuck',
+        kind: 'error',
+        title: t.composer.queueStuckTitle,
+        message: t.composer.queueStuckBody
+      })
     }
 
     void runDrain(() => entry)
@@ -402,10 +415,18 @@ export function useComposerQueue({
   // strand them. A park (explicit Stop/Esc) is the one gate: those entries wait
   // for the user. To cancel queued turns, the user deletes them from the panel.
   useEffect(() => {
+    // Same gate as the background drainer: while the session list is
+    // unavailable, a restored localStorage entry has no resumable runtime to
+    // target, so draining only burns its retry budget and toasts. Covers app
+    // boot, a gateway/profile switch, and any refresh over an empty list.
+    if (sessionsLoading) {
+      return
+    }
+
     if (shouldAutoDrain({ isBusy: busy, parked: queueParked, queueLength: queuedPrompts.length })) {
       return autoDrainNext()
     }
-  }, [autoDrainNext, busy, drainRetryTick, queueParked, queuedPrompts.length])
+  }, [autoDrainNext, busy, drainRetryTick, queueParked, queuedPrompts.length, sessionsLoading])
 
   // Queue-edit cleanup: on session swap the scope effect already stashed the
   // edit snapshot; only restore into the composer when still on the same scope.

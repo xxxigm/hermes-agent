@@ -6,6 +6,7 @@ import { resetBrowseState } from '@/store/composer-input-history'
 import {
   $parkedQueueSessions,
   $queuedPromptsBySession,
+  clearQueuedPrompts,
   getQueuedPrompts,
   MAX_AUTO_DRAIN_ATTEMPTS,
   type QueuedPromptEntry,
@@ -13,7 +14,13 @@ import {
   shouldAutoDrain
 } from '@/store/composer-queue'
 import { notify } from '@/store/notifications'
-import { $sessions, idsShareLineage } from '@/store/session'
+import {
+  $sessions,
+  $sessionsLoading,
+  idsShareLineage,
+  ownerLookupSessionRows,
+  sessionRowsIncludeId
+} from '@/store/session'
 import { $workingSessionIds } from '@/store/session-states'
 
 import type { SubmitTextOptions } from './use-prompt-actions/utils'
@@ -46,6 +53,7 @@ export function useBackgroundQueueDrain({
   const { t } = useI18n()
   const queuedPromptsBySession = useStore($queuedPromptsBySession)
   const parkedQueueSessions = useStore($parkedQueueSessions)
+  const sessionsLoading = useStore($sessionsLoading)
   const workingSessionIds = useStore($workingSessionIds)
   const submitTextRef = useRef(submitText)
   const drainingSessionIdsRef = useRef(new Set<string>())
@@ -94,18 +102,27 @@ export function useBackgroundQueueDrain({
         const failures = (drainFailuresRef.current.get(entry.id) ?? 0) + 1
         drainFailuresRef.current.set(entry.id, failures)
 
-        if (failures >= MAX_AUTO_DRAIN_ATTEMPTS) {
-          notify({
-            id: `composer-background-queue-stuck-${sessionKey}`,
-            kind: 'error',
-            title: t.composer.queueStuckTitle,
-            message: t.composer.queueStuckBody
-          })
+        if (failures < MAX_AUTO_DRAIN_ATTEMPTS) {
+          scheduleRetry()
 
           return
         }
 
-        scheduleRetry()
+        // A leftover localStorage key whose conversation is not in the loaded
+        // list cannot resume (deleted / ghost / other HERMES_HOME). Drop it
+        // instead of toasting — the toast is for a chat the user can still open.
+        if (!sessionRowsIncludeId(ownerLookupSessionRows(), sessionKey)) {
+          clearQueuedPrompts(sessionKey)
+
+          return
+        }
+
+        notify({
+          id: `composer-background-queue-stuck-${sessionKey}`,
+          kind: 'error',
+          title: t.composer.queueStuckTitle,
+          message: t.composer.queueStuckBody
+        })
       }
 
       void Promise.resolve()
@@ -151,13 +168,25 @@ export function useBackgroundQueueDrain({
   )
 
   useEffect(() => {
-    if (!enabled) {
+    // While the session list is unavailable, a queue restored from
+    // localStorage has no resumable runtime to target: every attempt is
+    // rejected against a reaped runtime, and four of them exhaust the entry's
+    // budget and toast "queued message not sent" before the user has done
+    // anything. Covers app boot, a gateway/profile switch, and any refresh
+    // over an empty list. Once the list lands, submitText resumes by stored id.
+    if (!enabled || sessionsLoading) {
       return
     }
 
     // Queue keys prefer the lineage root (resolveComposerSessionKey) while
     // $workingSessionIds / selection may hold the compression tip. Strict
     // equality then mis-classifies a busy or selected chat as idle/offscreen.
+    //
+    // Boot/reconnect: the composer queue survives in localStorage, but session
+    // runtimes are reaped. Draining before the sidebar list has loaded burns
+    // MAX_AUTO_DRAIN_ATTEMPTS against a backend that cannot resume yet, then
+    // toasts "Queued message not sent" on every launch even when the user has
+    // no visible queue (#98015).
     const sessions = $sessions.get()
     const working = [...workingSessionIds]
 
@@ -194,6 +223,7 @@ export function useBackgroundQueueDrain({
     queuedPromptsBySession,
     retryTick,
     selectedStoredSessionId,
+    sessionsLoading,
     workingSessionIds
   ])
 }

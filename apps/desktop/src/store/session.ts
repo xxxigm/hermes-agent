@@ -367,6 +367,24 @@ export const sessionMatchesStoredId = (
   session._lineage_root_id === storedSessionId ||
   Boolean(session._lineage_ids?.includes(storedSessionId))
 
+/** True when `storedId` names a conversation already in the loaded rows.
+ *
+ *  Composer-queue keys persist in localStorage across launches. After the
+ *  sidebar list has loaded, a leftover key that is not in those rows cannot
+ *  be resumed — auto-drain must drop it rather than toast "queued message
+ *  not sent". A key that IS listed still retries and toasts: that chat is
+ *  one the user can still open. Off-page / hidden chats are not in this
+ *  list; they still try resume-by-stored-id first, and only this predicate
+ *  decides toast-vs-drop after the send has already failed. */
+export function sessionRowsIncludeId(
+  sessions: readonly Pick<SessionInfo, '_lineage_ids' | '_lineage_root_id' | 'id'>[],
+  storedId: string
+): boolean {
+  const id = storedId.trim()
+
+  return Boolean(id) && sessions.some(session => sessionMatchesStoredId(session, id))
+}
+
 // Alias lookup, memoized per sessions-list reference. `lineageAliases` runs
 // per cached session state per status projection per message delta — an
 // O(sessions) scan there multiplies out to states × sessions × ~30Hz per busy
