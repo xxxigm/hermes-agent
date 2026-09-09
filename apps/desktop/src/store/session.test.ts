@@ -53,6 +53,7 @@ import {
   sessionMatchesStoredId,
   sessionOwnerRouteFromRow,
   sessionPinId,
+  sessionRowsIncludeId,
   setComposerSelectionOwner,
   setConnection,
   setCurrentCwd,
@@ -377,6 +378,8 @@ describe('lineageAliases across a deep compression chain', () => {
     expect(lineageAliases('mid', rows).sort()).toEqual(['mid', 'root', 'tip'])
     expect(lineageAliases('tip', rows).sort()).toEqual(['mid', 'root', 'tip'])
     expect(sessionMatchesStoredId(rows[0], 'mid')).toBe(true)
+    expect(sessionRowsIncludeId(rows, 'mid')).toBe(true)
+    expect(sessionRowsIncludeId(rows, 'ghost')).toBe(false)
   })
 })
 

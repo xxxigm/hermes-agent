@@ -10,6 +10,9 @@ import {
   MAX_AUTO_DRAIN_ATTEMPTS,
   parkQueuedPrompts
 } from '@/store/composer-queue'
+import { $notifications, clearNotifications } from '@/store/notifications'
+import { $sessions, setSessions, setSessionsLoading } from '@/store/session'
+import { makeSessionInfo } from '@/test/session-info'
 
 import type { QueueEditState } from '../composer-utils'
 import type { ChatBarProps } from '../types'
@@ -58,6 +61,9 @@ describe('useComposerQueue park integration', () => {
     window.localStorage.clear()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    $sessions.set([])
+    setSessionsLoading(false)
+    clearNotifications()
   })
 
   afterEach(() => {
@@ -65,6 +71,9 @@ describe('useComposerQueue park integration', () => {
     vi.restoreAllMocks()
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
+    $sessions.set([])
+    setSessionsLoading(true)
+    clearNotifications()
   })
 
   it('reschedules rejected foreground drains to a bounded stop and keeps manual recovery', async () => {
@@ -72,6 +81,7 @@ describe('useComposerQueue park integration', () => {
 
     try {
       const entry = enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'recoverable' })!
+      setSessions([makeSessionInfo({ id: SESSION_KEY })])
       const { hook, onSubmit } = renderQueueHook({ busy: true })
       onSubmit.mockResolvedValue(false)
       hook.rerender({ busy: false })
@@ -252,5 +262,63 @@ describe('useComposerQueue park integration', () => {
 
     expect(isQueueParked(SESSION_KEY)).toBe(false)
     expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+  })
+
+  it('does not auto-drain restored queues while the session list is still loading', async () => {
+    setSessionsLoading(true)
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'wait for session list' })
+
+    const { onSubmit } = renderQueueHook()
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(1)
+  })
+
+  it('auto-drains a restored queue once the session list finishes loading', async () => {
+    setSessionsLoading(true)
+    enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'send after load' })
+
+    const { hook, onSubmit } = renderQueueHook()
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+    expect(onSubmit).not.toHaveBeenCalled()
+
+    setSessionsLoading(false)
+    hook.rerender({ busy: false })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+  })
+
+  it('drops an unlisted leftover queue after bounded failures instead of toasting', async () => {
+    vi.useFakeTimers()
+
+    try {
+      enqueueQueuedPrompt(SESSION_KEY, { attachments: [], text: 'orphaned leftover' })
+      const { hook, onSubmit } = renderQueueHook({ busy: true })
+      onSubmit.mockResolvedValue(false)
+      hook.rerender({ busy: false })
+      await act(async () => {
+        await Promise.resolve()
+      })
+
+      for (let attempt = 1; attempt < MAX_AUTO_DRAIN_ATTEMPTS; attempt++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(30_000)
+        })
+      }
+
+      expect(onSubmit).toHaveBeenCalledTimes(MAX_AUTO_DRAIN_ATTEMPTS)
+      expect(getQueuedPrompts(SESSION_KEY)).toHaveLength(0)
+      expect($notifications.get().some(item => item.id === 'composer-queue-stuck')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

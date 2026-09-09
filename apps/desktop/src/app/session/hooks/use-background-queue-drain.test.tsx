@@ -8,9 +8,11 @@ import {
   $queuedPromptsBySession,
   enqueueQueuedPrompt,
   getQueuedPrompts,
+  MAX_AUTO_DRAIN_ATTEMPTS,
   parkQueuedPrompts
 } from '@/store/composer-queue'
-import { $sessions, setSessions } from '@/store/session'
+import { $notifications, clearNotifications } from '@/store/notifications'
+import { $sessions, setSessions, setSessionsLoading } from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -62,6 +64,9 @@ describe('useBackgroundQueueDrain', () => {
   beforeEach(() => {
     vi.useRealTimers()
     clearAllSessionStates()
+    // Production drain waits for the sidebar list. Tests that assert drain
+    // behavior are post-load unless they opt into the loading gate.
+    setSessionsLoading(false)
   })
 
   afterEach(() => {
@@ -71,6 +76,8 @@ describe('useBackgroundQueueDrain', () => {
     $queuedPromptsBySession.set({})
     $parkedQueueSessions.set({})
     $sessions.set([])
+    setSessionsLoading(true)
+    clearNotifications()
     clearAllSessionStates()
   })
 
@@ -221,5 +228,106 @@ describe('useBackgroundQueueDrain', () => {
 
     expect(submitText).toHaveBeenCalledTimes(2)
     expect(getQueuedPrompts('stored-session-a')).toHaveLength(0)
+  })
+
+  it('does not drain restored queues while the session list is still loading', async () => {
+    vi.useFakeTimers()
+    setSessionsLoading(true)
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'wait for session list', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    // Four 750ms retries is what used to burn the drain budget and toast on boot.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(750 * 4)
+      await Promise.resolve()
+    })
+
+    expect(submitText).not.toHaveBeenCalled()
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+  })
+
+  it('drains a restored background queue once the session list finishes loading', async () => {
+    setSessionsLoading(true)
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => true)
+
+    enqueueQueuedPrompt('stored-session-a', { text: 'send after load', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    await new Promise(resolve => window.setTimeout(resolve, 0))
+    expect(submitText).not.toHaveBeenCalled()
+
+    setSessionsLoading(false)
+
+    await waitFor(() => {
+      expect(submitText).toHaveBeenCalledWith('send after load', {
+        attachments: [],
+        fromQueue: true,
+        sessionId: 'rt-session-a',
+        storedSessionId: 'stored-session-a'
+      })
+    })
+
+    await waitFor(() => expect(getQueuedPrompts('stored-session-a')).toHaveLength(0))
+  })
+
+  it('drops an unlisted leftover queue after bounded failures instead of toasting', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map<string, string>() }
+    const submitText = vi.fn(async () => false)
+
+    enqueueQueuedPrompt('ghost-session', { text: 'orphaned leftover', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    for (let attempt = 1; attempt < MAX_AUTO_DRAIN_ATTEMPTS; attempt++) {
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(750)
+      })
+    }
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(submitText).toHaveBeenCalledTimes(MAX_AUTO_DRAIN_ATTEMPTS)
+    expect(getQueuedPrompts('ghost-session')).toHaveLength(0)
+    expect($notifications.get().some(item => item.id.startsWith('composer-background-queue-stuck'))).toBe(false)
+  })
+
+  it('toasts a listed session queue that keeps failing, and leaves it for manual send', async () => {
+    vi.useFakeTimers()
+
+    const runtimeMap = { current: new Map([['stored-session-a', 'rt-session-a']]) }
+    const submitText = vi.fn(async () => false)
+
+    setSessions([lineageSession({ id: 'stored-session-a' })])
+    enqueueQueuedPrompt('stored-session-a', { text: 'still recoverable', attachments: [] })
+
+    render(<Harness runtimeMap={runtimeMap} submitText={submitText} />)
+
+    for (let attempt = 1; attempt < MAX_AUTO_DRAIN_ATTEMPTS; attempt++) {
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(750)
+      })
+    }
+
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(submitText).toHaveBeenCalledTimes(MAX_AUTO_DRAIN_ATTEMPTS)
+    expect(getQueuedPrompts('stored-session-a')).toHaveLength(1)
+    expect($notifications.get().some(item => item.id === 'composer-background-queue-stuck-stored-session-a')).toBe(true)
   })
 })
